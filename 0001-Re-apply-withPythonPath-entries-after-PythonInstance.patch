@@ -1,0 +1,108 @@
+From 1cbc581415bb2bf47f23e5abc8a8fbfc241f1a7d Mon Sep 17 00:00:00 2001
+From: Alex Truslow <atruslow@hubspot.com>
+Date: Wed, 25 Nov 2026 14:34:49 -0500
+Subject: [PATCH] Re-apply withPythonPath entries after PythonInstance.reset()
+
+withPythonPath is factory configuration, but the entries were only
+inserted into sys.path by the constructor. reset() restores the
+pre-initialized memory snapshot, which wipes them, so any caller that
+reuses instances via reset() silently lost its configured import path
+and imports from those directories started failing.
+
+Keep the path on the instance and re-inject it after restoring the
+snapshot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../com/hubspot/boomslang/PythonInstance.java |  8 +++---
+ .../boomslang/tests/PythonExecutorTest.java   | 27 +++++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/core/src/main/java/com/hubspot/boomslang/PythonInstance.java b/core/src/main/java/com/hubspot/boomslang/PythonInstance.java
+index 318ae23..0596b24 100644
+--- a/core/src/main/java/com/hubspot/boomslang/PythonInstance.java
++++ b/core/src/main/java/com/hubspot/boomslang/PythonInstance.java
+@@ -3,6 +3,7 @@ package com.hubspot.boomslang;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Path;
+ import java.util.Objects;
++import java.util.Optional;
+ import java.util.UUID;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import javax.annotation.Nullable;
+@@ -34,6 +35,7 @@ public class PythonInstance implements AutoCloseable {
+   private final Instance wasmInstance;
+   private final CopyOnWriteMemory cowMemory;
+   private final ResourceLimits limits;
++  private final Optional<String> pythonPath;
+   private final AtomicBoolean codeLoaded = new AtomicBoolean(false);
+   private final AtomicBoolean closed = new AtomicBoolean(false);
+   private final AtomicBoolean poisoned = new AtomicBoolean(false);
+@@ -91,6 +93,7 @@ public class PythonInstance implements AutoCloseable {
+     ResourceLimits limits
+   ) {
+     this.limits = limits;
++    this.pythonPath = Optional.ofNullable(pythonPath);
+     this.instanceId = UUID.randomUUID().toString().substring(0, 8);
+     this.stdinStream = new ResettableByteArrayInputStream();
+ 
+@@ -150,9 +153,7 @@ public class PythonInstance implements AutoCloseable {
+     this.getHeapPagesFunc = wasmInstance.export("get_heap_pages");
+     this.goldenMemoryPages = image.getGoldenMemoryPages();
+ 
+-    if (pythonPath != null) {
+-      injectPythonPath(pythonPath);
+-    }
++    this.pythonPath.ifPresent(this::injectPythonPath);
+   }
+ 
+   private void injectPythonPath(String pythonPath) {
+@@ -411,6 +412,7 @@ public class PythonInstance implements AutoCloseable {
+     codeLoaded.set(false);
+     poisoned.set(false);
+     clearStdin();
++    pythonPath.ifPresent(this::injectPythonPath);
+   }
+ 
+   /**
+diff --git a/tests/src/test/java/com/hubspot/boomslang/tests/PythonExecutorTest.java b/tests/src/test/java/com/hubspot/boomslang/tests/PythonExecutorTest.java
+index 4ab4d0d..33d5f3b 100644
+--- a/tests/src/test/java/com/hubspot/boomslang/tests/PythonExecutorTest.java
++++ b/tests/src/test/java/com/hubspot/boomslang/tests/PythonExecutorTest.java
+@@ -124,6 +124,33 @@ class PythonExecutorTest {
+     assertThat(result.stdout().trim()).isEqualTo("1");
+   }
+ 
++  @Test
++  void itKeepsPythonPathAfterReset() throws Exception {
++    PythonExecutorFactory pathFactory = PythonExecutorFactory
++      .builder()
++      .withStdlibPath(SharedTestSetup.createRootPath())
++      .withPythonPath("/work/libs:/work/more")
++      .addHostFunctions(SharedTestSetup.defaultHostFunctions())
++      .build();
++    String countPaths = String.join(
++      "\n",
++      "import sys",
++      "print(sum(p in ('/work/libs', '/work/more') for p in sys.path))"
++    );
++
++    PythonResult result = pathFactory.runOnWasmThread(() -> {
++      PythonInstance instance = pathFactory.createInstance(
++        SharedTestSetup.createRootPath()
++      );
++      instance.reset();
++      instance.reset();
++      return instance.execute(countPaths);
++    });
++
++    assertThat(result.exitCode()).isEqualTo(0);
++    assertThat(result.stdout().trim()).isEqualTo("2");
++  }
++
+   @Test
+   void itWritesAndReadsPngWithPillow() {
+     PythonResult result = factory.runOnWasmThread(() -> {
+-- 
+2.49.0
+
